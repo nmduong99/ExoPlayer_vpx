@@ -27,28 +27,25 @@ fi
 
 # configuration parameters common to all architectures
 common_params="--disable-examples --disable-docs --enable-realtime-only"
-common_params+=" --disable-vp8 --disable-vp9-encoder --disable-webm-io"
+common_params+=" --enable-vp8 --disable-vp9-encoder --disable-webm-io"
 common_params+=" --disable-libyuv --disable-runtime-cpu-detect"
 common_params+=" --enable-external-build"
+common_params+=" --disable-tools"
 
 # configuration parameters for various architectures
+
+# ARMv7-A (armeabi-v7a) — NO NEON
 arch[0]="armeabi-v7a"
-config[0]="--target=armv7-android-gcc --enable-neon --enable-neon-asm"
+config[0]="--target=armv7-android-gcc"
+config[0]+=" --disable-neon --disable-neon-asm"
 
-arch[1]="x86"
-config[1]="--force-target=x86-android-gcc --disable-sse2"
-config[1]+=" --disable-sse3 --disable-ssse3 --disable-sse4_1 --disable-avx"
-config[1]+=" --disable-avx2 --enable-pic"
-
-arch[2]="arm64-v8a"
-config[2]="--force-target=armv8-android-gcc --enable-neon"
-
-arch[3]="x86_64"
-config[3]="--force-target=x86_64-android-gcc --disable-sse2"
-config[3]+=" --disable-sse3 --disable-ssse3 --disable-sse4_1 --disable-avx"
-config[3]+=" --disable-avx2 --enable-pic --disable-neon --disable-neon-asm"
+# ARM64 (arm64-v8a)
+arch[1]="arm64-v8a"
+config[1]="--force-target=armv8-android-gcc"
+config[1]+=" --enable-neon"
 
 limit=$((${#arch[@]} - 1))
+
 
 # list of files allowed after running configure in each arch directory.
 # everything else will be removed.

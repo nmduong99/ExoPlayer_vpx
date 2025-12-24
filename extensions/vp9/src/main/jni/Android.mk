@@ -32,6 +32,9 @@ LOCAL_SRC_FILES := vpx_jni.cc
 LOCAL_LDLIBS := -llog -lz -lm -landroid
 LOCAL_SHARED_LIBRARIES := libvpx
 LOCAL_STATIC_LIBRARIES := cpufeatures
+
+# Alternative form if your toolchain expects -z syntax:
+LOCAL_LDFLAGS += -Wl,-z,max-page-size=16384
 include $(BUILD_SHARED_LIBRARY)
 
 $(call import-module,android/cpufeatures)
