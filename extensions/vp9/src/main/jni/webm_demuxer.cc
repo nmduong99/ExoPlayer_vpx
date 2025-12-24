@@ -21,9 +21,9 @@ WebmDemuxer::~WebmDemuxer() {
   close();
 }
 
-// ============================
+// =======================
 // OPEN
-// ============================
+// =======================
 bool WebmDemuxer::open(const char* path) {
   close();
 
@@ -44,7 +44,7 @@ bool WebmDemuxer::open(const char* path) {
     return false;
   }
 
-  if (!initTracks()) {
+  if (!initVideoTrack()) {
     close();
     return false;
   }
@@ -54,10 +54,10 @@ bool WebmDemuxer::open(const char* path) {
   return cluster_ != nullptr;
 }
 
-// ============================
-// INIT TRACKS (VP9 only)
-// ============================
-bool WebmDemuxer::initTracks() {
+// =======================
+// FIND VP9 TRACK
+// =======================
+bool WebmDemuxer::initVideoTrack() {
   const Tracks* tracks = segment_->GetTracks();
   if (!tracks) return false;
 
@@ -74,89 +74,84 @@ bool WebmDemuxer::initTracks() {
   return false;
 }
 
-// ============================
+// =======================
 // READ NEXT FRAME
-// ============================
+// =======================
 bool WebmDemuxer::readFrame(uint8_t** data, size_t* size) {
   if (!segment_ || !cluster_) return false;
 
   while (true) {
     if (!block_entry_) {
-      block_entry_ = cluster_->GetFirst();
+      cluster_->GetFirst(block_entry_);
     } else {
-      block_entry_ = cluster_->GetNext(block_entry_);
+      cluster_->GetNext(block_entry_, block_entry_);
     }
 
-    // Move to next cluster if needed
     while (!block_entry_) {
       cluster_ = segment_->GetNext(cluster_);
-      if (!cluster_) {
-        return false; // EOF
-      }
-      block_entry_ = cluster_->GetFirst();
+      if (!cluster_) return false;
+      cluster_->GetFirst(block_entry_);
     }
 
     const Block* block = block_entry_->GetBlock();
     if (!block) continue;
 
-    if (block->GetTrackNumber() != video_track_) {
-      continue;
+    if (block->GetTrackNumber() != video_track_) continue;
+    if (block->GetFrameCount() <= 0) continue;
+
+    const Block::Frame& frame = block->GetFrame(0);
+
+    if (frame.len <= 0) continue;
+
+    if (frame.len > buffer_size_) {
+      buffer_ = static_cast<uint8_t*>(realloc(buffer_, frame.len));
+      buffer_size_ = frame.len;
     }
 
-    // VP9 frame (1 frame per block expected)
-    const int frame_size = block->GetFrameSize(0);
-    if (frame_size <= 0) continue;
-
-    if (static_cast<size_t>(frame_size) > buffer_size_) {
-      buffer_ = static_cast<uint8_t*>(realloc(buffer_, frame_size));
-      buffer_size_ = frame_size;
-    }
-
-    block->GetFrame(0, buffer_);
+    memcpy(buffer_, frame.data, frame.len);
     *data = buffer_;
-    *size = static_cast<size_t>(frame_size);
+    *size = frame.len;
     return true;
   }
 }
 
-// ============================
-// SEEK (milliseconds)
-// ============================
+// =======================
+// SEEK (KEYFRAME-BASED)
+// =======================
 bool WebmDemuxer::seekMs(int64_t timeMs) {
   if (!segment_) return false;
 
   const Cues* cues = segment_->GetCues();
   if (!cues) return false;
 
-  // libwebm uses nanoseconds
   const int64_t timeNs = timeMs * 1000000LL;
 
   const CuePoint* cue = nullptr;
-  if (cues->Find(timeNs, cue) != 0 || !cue) {
+  const CuePoint::TrackPosition* track_pos = nullptr;
+
+  if (!cues->Find(timeNs,
+                  segment_->GetTracks()->GetTrackByNumber(video_track_),
+                  cue,
+                  track_pos)) {
     return false;
   }
 
-  const CueTrackPosition* pos =
-      cue->GetTrackPosition(video_track_);
-  if (!pos) return false;
+  if (!track_pos) return false;
 
-  const int64_t cluster_pos = pos->m_cluster_pos;
+  const long long cluster_pos = track_pos->m_pos;
 
-  // Seek reader to cluster position
-  if (reader_->SetPosition(cluster_pos) != 0) {
+  // Load cluster at position
+  if (segment_->LoadCluster(cluster_pos, cluster_) != 0) {
     return false;
   }
 
-  // Re-parse cluster
-  cluster_ = segment_->GetCluster(cluster_pos);
   block_entry_ = nullptr;
-
-  return cluster_ != nullptr;
+  return true;
 }
 
-// ============================
+// =======================
 // CLOSE
-// ============================
+// =======================
 void WebmDemuxer::close() {
   if (segment_) {
     delete segment_;
@@ -167,6 +162,7 @@ void WebmDemuxer::close() {
     delete reader_;
     reader_ = nullptr;
   }
+
   cluster_ = nullptr;
   block_entry_ = nullptr;
   video_track_ = -1;
