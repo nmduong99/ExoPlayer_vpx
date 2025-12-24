@@ -83,7 +83,7 @@ ALPHA_DECODER_FUNC(jboolean, init, jstring jPath) {
   std::memset(ctx, 0, sizeof(AlphaJniCtx));
 
   if (!ctx->demuxer.open(path)) {
-    LOGE("Failed to open IVF file");
+    LOGE("Trying to open IVF path: %s", path);
     env->ReleaseStringUTFChars(jPath, path);
     delete ctx;
     return JNI_FALSE;
