@@ -25,10 +25,10 @@ include libvpx.mk
 # build libvpxV2JNI.so
 include $(CLEAR_VARS)
 LOCAL_PATH := $(WORKING_DIR)
-LOCAL_MODULE := libvpxV2JNI
+LOCAL_MODULE := libvpxalphaV2JNI
 LOCAL_ARM_MODE := arm
 LOCAL_CPP_EXTENSION := .cc
-LOCAL_SRC_FILES := vpx_jni.cc
+LOCAL_SRC_FILES := ivf_demuxer.cc vpx_alpha_jni.cc
 LOCAL_LDLIBS := -llog -lz -lm -landroid
 LOCAL_SHARED_LIBRARIES := libvpx
 LOCAL_STATIC_LIBRARIES := cpufeatures
