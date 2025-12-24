@@ -28,7 +28,15 @@ LOCAL_PATH := $(WORKING_DIR)
 LOCAL_MODULE := libvpxalphaV2JNI
 LOCAL_ARM_MODE := arm
 LOCAL_CPP_EXTENSION := .cc
-LOCAL_SRC_FILES := ivf_demuxer.cc vpx_alpha_jni.cc
+LOCAL_SRC_FILES := vpx_alpha_jni.cc
+LOCAL_SRC_FILES += \
+    webm_demuxer.cc \
+    libwebm/mkvparser/mkvparser.cc \
+    libwebm/mkvparser/mkvreader.cc
+LOCAL_C_INCLUDES += \
+    $(WORKING_DIR)/libwebm \
+    $(WORKING_DIR)/libwebm/mkvparser
+
 LOCAL_LDLIBS := -llog -lz -lm -landroid
 LOCAL_SHARED_LIBRARIES := libvpx
 LOCAL_STATIC_LIBRARIES := cpufeatures

@@ -13,7 +13,7 @@
 #define VPX_CODEC_DISABLE_COMPAT 1
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
-#include "ivf_demuxer.h"
+#include "webm_demuxer.h"
 
 #define LOG_TAG "www_vpx_alpha_jni"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -42,7 +42,7 @@
 struct AlphaJniCtx {
   vpx_codec_ctx_t decoder;
   vpx_image_t* image;
-  IvfDemuxer demuxer;
+  WebmDemuxer demuxer;
   bool initialized;
 };
 
@@ -121,6 +121,9 @@ ALPHA_DECODER_FUNC(jboolean, decodeNextFrame) {
   if (!ctx->demuxer.readFrame(&data, &size)) {
     return JNI_FALSE; // EOF
   }
+
+  vpx_codec_decode(&ctx->decoder, data, size, nullptr, 0);
+
 
   if (vpx_codec_decode(&ctx->decoder, data, size, nullptr, 0) != VPX_CODEC_OK) {
     LOGE("vpx_codec_decode failed");
@@ -210,4 +213,32 @@ ALPHA_DECODER_FUNC(void, release) {
   ctx->demuxer.close();
   delete ctx;
   setCtx(env, thiz, nullptr);
+}
+
+// ======================================================
+// seekTo()
+// ======================================================
+ALPHA_DECODER_FUNC(jboolean, seekTo, jlong jContext, jlong timeMs) {
+  AlphaJniCtx* ctx = reinterpret_cast<AlphaJniCtx*>(jContext);
+  if (!ctx) return JNI_FALSE;
+
+  // 1. seek demuxer
+  if (!ctx->demuxer.seekMs(timeMs)) {
+    return JNI_FALSE;
+  }
+
+  // 2. reset decoder (BẮT BUỘC)
+  vpx_codec_destroy(&ctx->decoder);
+
+  vpx_codec_dec_cfg_t cfg = {0};
+  cfg.threads = 2;
+
+  if (vpx_codec_dec_init(&ctx->decoder,
+                         &vpx_codec_vp9_dx_algo,
+                         &cfg, 0) != VPX_CODEC_OK) {
+    return JNI_FALSE;
+  }
+
+  ctx->image = nullptr;
+  return JNI_TRUE;
 }
