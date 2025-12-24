@@ -132,6 +132,10 @@ ALPHA_DECODER_FUNC(jboolean, decodeNextFrame) {
 
   vpx_codec_iter_t iter = nullptr;
   ctx->image = vpx_codec_get_frame(&ctx->decoder, &iter);
+  LOGE("www fmt=%d planes: Y=%p U=%p V=%p A=%p",
+     ctx->image->fmt,
+     ctx->image->planes[0], ctx->image->planes[1],
+     ctx->image->planes[2], ctx->image->planes[3]);
   return ctx->image != nullptr ? JNI_TRUE : JNI_FALSE;
 }
 
