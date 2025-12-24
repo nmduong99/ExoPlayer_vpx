@@ -122,10 +122,10 @@ ALPHA_DECODER_FUNC(jboolean, decodeNextFrame) {
     return JNI_FALSE; // EOF
   }
 
-  vpx_codec_decode(&ctx->decoder, data, size, nullptr, 0);
+  auto ret = vpx_codec_decode(&ctx->decoder, data, size, nullptr, 0);
 
 
-  if (vpx_codec_decode(&ctx->decoder, data, size, nullptr, 0) != VPX_CODEC_OK) {
+  if (ret != VPX_CODEC_OK) {
     LOGE("vpx_codec_decode failed");
     return JNI_FALSE;
   }
