@@ -96,6 +96,7 @@ bool WebmDemuxer::initTracks() {
   const Track* vp9[2] = {nullptr, nullptr};
   int n = 0;
 
+  printf("www track count = %d\n", tracks->GetTracksCount());
   for (unsigned i = 0; i < tracks->GetTracksCount(); ++i) {
     const Track* t = tracks->GetTrackByIndex(i);
     if (!t) continue;
