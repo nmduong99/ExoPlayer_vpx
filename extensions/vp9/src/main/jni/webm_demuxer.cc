@@ -60,7 +60,7 @@ bool WebmDemuxer::open(const char* path) {
 bool WebmDemuxer::initTracks() {
   const Tracks* tracks = segment_->GetTracks();
 
-  LOGE("www webm demuxer get tracks size: %d", tracks->GetTracksCount()); 
+  printf("www webm demuxer get tracks size: %d\n", tracks->GetTracksCount()); 
   if (!tracks) return false;
 
   // Pick first two VP9 video tracks. Prefer title tags if present.
