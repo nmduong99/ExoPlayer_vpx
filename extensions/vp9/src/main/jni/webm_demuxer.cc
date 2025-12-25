@@ -18,9 +18,11 @@ WebmDemuxer::WebmDemuxer()
       color_entry_(nullptr),
       alpha_entry_(nullptr),
       color_buf_(nullptr),
-      color_buf_size_(0),
+      color_cap_(0),
       alpha_buf_(nullptr),
-      alpha_buf_size_(0) {}
+      alpha_cap_(0),
+      width_(0),
+      height_(0) {}
 
 WebmDemuxer::~WebmDemuxer() { close(); }
 
@@ -54,124 +56,143 @@ bool WebmDemuxer::open(const char* path) {
   color_entry_ = nullptr;
   alpha_entry_ = nullptr;
 
+  // width/height from color track
+  const auto* vt = static_cast<const VideoTrack*>(color_track_);
+  width_ = (int)vt->GetWidth();
+  height_ = (int)vt->GetHeight();
+
   return true;
+}
+
+void WebmDemuxer::close() {
+  if (segment_) {
+    delete segment_;
+    segment_ = nullptr;
+  }
+  if (reader_) {
+    reader_->Close();
+    delete reader_;
+    reader_ = nullptr;
+  }
+
+  color_track_ = nullptr;
+  alpha_track_ = nullptr;
+  color_cluster_ = nullptr;
+  alpha_cluster_ = nullptr;
+  color_entry_ = nullptr;
+  alpha_entry_ = nullptr;
+
+  if (color_buf_) { std::free(color_buf_); color_buf_ = nullptr; color_cap_ = 0; }
+  if (alpha_buf_) { std::free(alpha_buf_); alpha_buf_ = nullptr; alpha_cap_ = 0; }
+
+  width_ = 0;
+  height_ = 0;
 }
 
 bool WebmDemuxer::initTracks() {
   const Tracks* tracks = segment_->GetTracks();
-
-  printf("www webm demuxer get tracks size: %d\n", tracks->GetTracksCount()); 
   if (!tracks) return false;
 
-  // Pick first two VP9 video tracks. Prefer title tags if present.
-  const Track* vp9_tracks[2] = {nullptr, nullptr};
-  int found = 0;
+  const Track* vp9[2] = {nullptr, nullptr};
+  int n = 0;
 
   for (unsigned i = 0; i < tracks->GetTracksCount(); ++i) {
     const Track* t = tracks->GetTrackByIndex(i);
     if (!t) continue;
     if (t->GetType() != Track::kVideo) continue;
     if (!t->GetCodecId() || std::strcmp(t->GetCodecId(), "V_VP9") != 0) continue;
-
-    if (found < 2) vp9_tracks[found++] = t;
+    if (n < 2) vp9[n++] = t;
   }
 
-  if (found < 2) {
-    // No separate alpha track; caller should use single-track alpha flow instead.
-    return false;
-  }
+  if (n < 2) return false;
 
-  // Heuristic: if track names exist and contain "alpha", use that.
-  const Track* t0 = vp9_tracks[0];
-  const Track* t1 = vp9_tracks[1];
-
-  const char* n0 = t0->GetNameAsUTF8();
-  const char* n1 = t1->GetNameAsUTF8();
-
+  // Prefer name containing "alpha" to decide alpha track.
   auto isAlphaName = [](const char* s) -> bool {
     if (!s) return false;
-    // simple case-insensitive contains "alpha"
     for (const char* p = s; *p; ++p) {
       if ((p[0] == 'a' || p[0] == 'A') &&
           (p[1] == 'l' || p[1] == 'L') &&
           (p[2] == 'p' || p[2] == 'P') &&
           (p[3] == 'h' || p[3] == 'H') &&
-          (p[4] == 'a' || p[4] == 'A')) {
-        return true;
-      }
+          (p[4] == 'a' || p[4] == 'A')) return true;
     }
     return false;
   };
 
+  const char* n0 = vp9[0]->GetNameAsUTF8();
+  const char* n1 = vp9[1]->GetNameAsUTF8();
+
   if (isAlphaName(n0) && !isAlphaName(n1)) {
-    alpha_track_ = t0;
-    color_track_ = t1;
+    alpha_track_ = vp9[0];
+    color_track_ = vp9[1];
   } else if (isAlphaName(n1) && !isAlphaName(n0)) {
-    alpha_track_ = t1;
-    color_track_ = t0;
+    alpha_track_ = vp9[1];
+    color_track_ = vp9[0];
   } else {
-    // fallback: assume first is color, second is alpha
-    color_track_ = t0;
-    alpha_track_ = t1;
+    // fallback: first=color, second=alpha
+    color_track_ = vp9[0];
+    alpha_track_ = vp9[1];
   }
 
   return color_track_ && alpha_track_;
 }
 
-int64_t WebmDemuxer::blockTimeNs(const Block* block, const Cluster* cluster) {
+int64_t WebmDemuxer::blockTimeNs(const Block* block, const Cluster* cluster) const {
   if (!block || !cluster) return -1;
   return block->GetTime(cluster);
 }
 
-bool WebmDemuxer::readNextBlockForTrack(const Track* track,
-                                        const BlockEntry** inOutEntry,
-                                        const Cluster** inOutCluster,
-                                        const Block** outBlock) {
-  if (!track || !inOutEntry || !inOutCluster || !outBlock) return false;
-  if (!segment_ || !(*inOutCluster)) return false;
+bool WebmDemuxer::nextBlockForTrack(const Track* track,
+                                   const Cluster** ioCluster,
+                                   const BlockEntry** ioEntry,
+                                   const Block** outBlock) {
+  if (!track || !ioCluster || !(*ioCluster) || !ioEntry || !outBlock) return false;
 
   while (true) {
-    if (!(*inOutEntry)) {
-      (*inOutCluster)->GetFirst(*inOutEntry);
+    if (!(*ioEntry)) {
+      (*ioCluster)->GetFirst(*ioEntry);
     } else {
-      (*inOutCluster)->GetNext(*inOutEntry, *inOutEntry);
+      (*ioCluster)->GetNext(*ioEntry, *ioEntry);
     }
 
-    while (!(*inOutEntry)) {
-      *inOutCluster = segment_->GetNext(*inOutCluster);
-      if (!(*inOutCluster)) return false;
-      (*inOutCluster)->GetFirst(*inOutEntry);
+    while (!(*ioEntry)) {
+      *ioCluster = segment_->GetNext(*ioCluster);
+      if (!(*ioCluster)) return false;
+      (*ioCluster)->GetFirst(*ioEntry);
     }
 
-    const Block* b = (*inOutEntry)->GetBlock();
+    const Block* b = (*ioEntry)->GetBlock();
     if (!b) continue;
     if (b->GetTrackNumber() != track->GetNumber()) continue;
-    if (b->GetFrameCount() != 1) continue;  // keep it simple
+
+    // Keep simplest: require 1 frame per block.
+    if (b->GetFrameCount() != 1) continue;
+
     *outBlock = b;
     return true;
   }
 }
 
-bool WebmDemuxer::readBlockPayload(const Block* block, MkvReader* reader,
-                                  uint8_t** ioBuf, size_t* ioBufSize,
+bool WebmDemuxer::readBlockPayload(const Block* block,
+                                  uint8_t** ioBuf, size_t* ioBufCap,
                                   const uint8_t** outPtr, size_t* outSize) {
-  if (!block || !reader || !ioBuf || !ioBufSize || !outPtr || !outSize) return false;
+  if (!block || !ioBuf || !ioBufCap || !outPtr || !outSize) return false;
   *outPtr = nullptr;
   *outSize = 0;
 
   if (block->GetFrameCount() != 1) return false;
-  const Block::Frame& frame = block->GetFrame(0);
-  if (frame.len <= 0) return false;
+  const Block::Frame& f = block->GetFrame(0);
+  if (f.len <= 0) return false;
 
-  const size_t need = static_cast<size_t>(frame.len);
-  if (need > *ioBufSize) {
+  const size_t need = static_cast<size_t>(f.len);
+  if (need > *ioBufCap) {
     uint8_t* nb = static_cast<uint8_t*>(std::realloc(*ioBuf, need));
     if (!nb) return false;
     *ioBuf = nb;
-    *ioBufSize = need;
+    *ioBufCap = need;
   }
 
-  if (frame.Read(reader, *ioBuf) != 0) return false;
+  if (f.Read(reader_, *ioBuf) != 0) return false;
 
   *outPtr = *ioBuf;
   *outSize = need;
@@ -191,52 +212,32 @@ bool WebmDemuxer::readPairedFrame(const uint8_t** colorData, size_t* colorSize,
   const Block* cb = nullptr;
   const Block* ab = nullptr;
 
-  // Prime both.
-  if (!readNextBlockForTrack(color_track_, &color_entry_, &color_cluster_, &cb)) return false;
-  if (!readNextBlockForTrack(alpha_track_, &alpha_entry_, &alpha_cluster_, &ab)) return false;
+  if (!nextBlockForTrack(color_track_, &color_cluster_, &color_entry_, &cb)) return false;
+  if (!nextBlockForTrack(alpha_track_, &alpha_cluster_, &alpha_entry_, &ab)) return false;
 
-  // Align by timestamp (best-effort).
   int64_t ct = blockTimeNs(cb, color_cluster_);
   int64_t at = blockTimeNs(ab, alpha_cluster_);
 
-  // Allow small drift due to encoder, but here we do strict alignment by advancing the earlier.
-  while (ct != at) {
-    if (ct < 0 || at < 0) break;
+  // Align by timestamp by advancing the earlier one.
+  while (ct >= 0 && at >= 0 && ct != at) {
     if (ct < at) {
-      // advance color
-      if (!readNextBlockForTrack(color_track_, &color_entry_, &color_cluster_, &cb)) return false;
+      if (!nextBlockForTrack(color_track_, &color_cluster_, &color_entry_, &cb)) return false;
       ct = blockTimeNs(cb, color_cluster_);
     } else {
-      // advance alpha
-      if (!readNextBlockForTrack(alpha_track_, &alpha_entry_, &alpha_cluster_, &ab)) return false;
+      if (!nextBlockForTrack(alpha_track_, &alpha_cluster_, &alpha_entry_, &ab)) return false;
       at = blockTimeNs(ab, alpha_cluster_);
     }
   }
 
-  if (!readBlockPayload(cb, reader_, &color_buf_, &color_buf_size_, colorData, colorSize)) return false;
-  if (!readBlockPayload(ab, reader_, &alpha_buf_, &alpha_buf_size_, alphaData, alphaSize)) return false;
+  if (!readBlockPayload(cb, &color_buf_, &color_cap_, colorData, colorSize)) return false;
+  if (!readBlockPayload(ab, &alpha_buf_, &alpha_cap_, alphaData, alphaSize)) return false;
 
   if (timeNs) *timeNs = (ct >= 0) ? ct : at;
   return true;
 }
 
 bool WebmDemuxer::seekMs(int64_t /*timeMs*/) {
-  // TODO: implement paired seek using Cues for each track.
-  // For now, simplest: return false / not supported.
+  // Minimal: not implemented here to keep structure small.
+  // If you need seek, we can implement cue-based seek for both tracks.
   return false;
-}
-
-void WebmDemuxer::close() {
-  if (segment_) { delete segment_; segment_ = nullptr; }
-  if (reader_) { reader_->Close(); delete reader_; reader_ = nullptr; }
-
-  color_track_ = nullptr;
-  alpha_track_ = nullptr;
-  color_cluster_ = nullptr;
-  alpha_cluster_ = nullptr;
-  color_entry_ = nullptr;
-  alpha_entry_ = nullptr;
-
-  if (color_buf_) { std::free(color_buf_); color_buf_ = nullptr; color_buf_size_ = 0; }
-  if (alpha_buf_) { std::free(alpha_buf_); alpha_buf_ = nullptr; alpha_buf_size_ = 0; }
 }

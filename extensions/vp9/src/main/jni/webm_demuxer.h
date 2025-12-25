@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstdint>
 #include <cstddef>
 
@@ -18,29 +17,31 @@ public:
   ~WebmDemuxer();
 
   bool open(const char* path);
+  void close();
 
-  // Reads next *paired* frame (color VP9 + alpha VP9).
-  // Buffers are owned by demuxer and valid until next readPairedFrame().
+  // Output pointers are valid until next readPairedFrame.
   bool readPairedFrame(const uint8_t** colorData, size_t* colorSize,
                        const uint8_t** alphaData, size_t* alphaSize,
                        int64_t* timeNs);
 
   bool seekMs(int64_t timeMs);
-  void close();
+
+  int colorWidth() const { return width_; }
+  int colorHeight() const { return height_; }
 
 private:
   bool initTracks();
-  bool readNextBlockForTrack(const mkvparser::Track* track,
-                             const mkvparser::BlockEntry** inOutEntry,
-                             const mkvparser::Cluster** inOutCluster,
-                             const mkvparser::Block** outBlock);
+  bool nextBlockForTrack(const mkvparser::Track* track,
+                         const mkvparser::Cluster** ioCluster,
+                         const mkvparser::BlockEntry** ioEntry,
+                         const mkvparser::Block** outBlock);
 
-  static int64_t blockTimeNs(const mkvparser::Block* block,
-                            const mkvparser::Cluster* cluster);
-
-  bool readBlockPayload(const mkvparser::Block* block, mkvparser::MkvReader* reader,
-                        uint8_t** ioBuf, size_t* ioBufSize,
+  bool readBlockPayload(const mkvparser::Block* block,
+                        uint8_t** ioBuf, size_t* ioBufCap,
                         const uint8_t** outPtr, size_t* outSize);
+
+  int64_t blockTimeNs(const mkvparser::Block* block,
+                      const mkvparser::Cluster* cluster) const;
 
   mkvparser::MkvReader* reader_;
   mkvparser::Segment* segment_;
@@ -53,9 +54,11 @@ private:
   const mkvparser::BlockEntry* color_entry_;
   const mkvparser::BlockEntry* alpha_entry_;
 
-  // internal buffers for encoded packets
   uint8_t* color_buf_;
-  size_t color_buf_size_;
+  size_t color_cap_;
   uint8_t* alpha_buf_;
-  size_t alpha_buf_size_;
+  size_t alpha_cap_;
+
+  int width_;
+  int height_;
 };
