@@ -26,8 +26,8 @@ if [ $# -ne 0 ]; then
 fi
 
 # configuration parameters common to all architectures
-common_params="--disable-examples --disable-docs"
-common_params+=" --enable-vp8 --enable-vp9 --disable-vp9-encoder --disable-webm-io"
+common_params="--disable-examples --disable-docs --enable-realtime-only"
+common_params+=" --enable-vp8 --disable-vp9-encoder --disable-webm-io"
 common_params+=" --disable-libyuv --disable-runtime-cpu-detect"
 common_params+=" --enable-external-build"
 common_params+=" --disable-tools"
