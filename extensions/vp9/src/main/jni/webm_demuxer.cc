@@ -11,15 +11,18 @@ using namespace mkvparser;
 WebmDemuxer::WebmDemuxer()
     : reader_(nullptr),
       segment_(nullptr),
-      cluster_(nullptr),
-      block_entry_(nullptr),
-      video_track_(nullptr),
-      buffer_(nullptr),
-      buffer_size_(0) {}
+      color_track_(nullptr),
+      alpha_track_(nullptr),
+      color_cluster_(nullptr),
+      alpha_cluster_(nullptr),
+      color_entry_(nullptr),
+      alpha_entry_(nullptr),
+      color_buf_(nullptr),
+      color_buf_size_(0),
+      alpha_buf_(nullptr),
+      alpha_buf_size_(0) {}
 
-WebmDemuxer::~WebmDemuxer() {
-  close();
-}
+WebmDemuxer::~WebmDemuxer() { close(); }
 
 bool WebmDemuxer::open(const char* path) {
   close();
@@ -36,191 +39,204 @@ bool WebmDemuxer::open(const char* path) {
     return false;
   }
 
-  // Load headers + clusters. For large files this is heavy, but matches your
-  // current design. If you want true streaming, we can switch to ParseHeaders()
-  // + incremental LoadCluster().
   if (segment_->Load() < 0) {
     close();
     return false;
   }
 
-  if (!initVideoTrack()) {
+  if (!initTracks()) {
     close();
     return false;
   }
 
-  cluster_ = segment_->GetFirst();
-  block_entry_ = nullptr;
-
-  // Position at first VP9 block.
-  if (!advanceToNextVp9Block()) {
-    // Could be empty or non-vp9-only file.
-    return false;
-  }
+  color_cluster_ = segment_->GetFirst();
+  alpha_cluster_ = segment_->GetFirst();
+  color_entry_ = nullptr;
+  alpha_entry_ = nullptr;
 
   return true;
 }
 
-bool WebmDemuxer::initVideoTrack() {
+bool WebmDemuxer::initTracks() {
   const Tracks* tracks = segment_->GetTracks();
+
+  LOGE("www webm demuxer get tracks size: %d", tracks->GetTracksCount()); 
   if (!tracks) return false;
 
-  for (unsigned i = 0; i < tracks->GetTracksCount(); ++i) {
-    const Track* track = tracks->GetTrackByIndex(i);
-    if (!track) continue;
+  // Pick first two VP9 video tracks. Prefer title tags if present.
+  const Track* vp9_tracks[2] = {nullptr, nullptr};
+  int found = 0;
 
-    if (track->GetType() == Track::kVideo &&
-        track->GetCodecId() &&
-        std::strcmp(track->GetCodecId(), "V_VP9") == 0) {
-      video_track_ = track;
-      return true;
-    }
+  for (unsigned i = 0; i < tracks->GetTracksCount(); ++i) {
+    const Track* t = tracks->GetTrackByIndex(i);
+    if (!t) continue;
+    if (t->GetType() != Track::kVideo) continue;
+    if (!t->GetCodecId() || std::strcmp(t->GetCodecId(), "V_VP9") != 0) continue;
+
+    if (found < 2) vp9_tracks[found++] = t;
   }
-  return false;
+
+  if (found < 2) {
+    // No separate alpha track; caller should use single-track alpha flow instead.
+    return false;
+  }
+
+  // Heuristic: if track names exist and contain "alpha", use that.
+  const Track* t0 = vp9_tracks[0];
+  const Track* t1 = vp9_tracks[1];
+
+  const char* n0 = t0->GetNameAsUTF8();
+  const char* n1 = t1->GetNameAsUTF8();
+
+  auto isAlphaName = [](const char* s) -> bool {
+    if (!s) return false;
+    // simple case-insensitive contains "alpha"
+    for (const char* p = s; *p; ++p) {
+      if ((p[0] == 'a' || p[0] == 'A') &&
+          (p[1] == 'l' || p[1] == 'L') &&
+          (p[2] == 'p' || p[2] == 'P') &&
+          (p[3] == 'h' || p[3] == 'H') &&
+          (p[4] == 'a' || p[4] == 'A')) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (isAlphaName(n0) && !isAlphaName(n1)) {
+    alpha_track_ = t0;
+    color_track_ = t1;
+  } else if (isAlphaName(n1) && !isAlphaName(n0)) {
+    alpha_track_ = t1;
+    color_track_ = t0;
+  } else {
+    // fallback: assume first is color, second is alpha
+    color_track_ = t0;
+    alpha_track_ = t1;
+  }
+
+  return color_track_ && alpha_track_;
 }
 
-bool WebmDemuxer::advanceToNextVp9Block() {
-  if (!segment_ || !cluster_ || !video_track_) return false;
+int64_t WebmDemuxer::blockTimeNs(const Block* block, const Cluster* cluster) {
+  if (!block || !cluster) return -1;
+  return block->GetTime(cluster);
+}
+
+bool WebmDemuxer::readNextBlockForTrack(const Track* track,
+                                        const BlockEntry** inOutEntry,
+                                        const Cluster** inOutCluster,
+                                        const Block** outBlock) {
+  if (!track || !inOutEntry || !inOutCluster || !outBlock) return false;
+  if (!segment_ || !(*inOutCluster)) return false;
 
   while (true) {
-    // Step within cluster.
-    if (!block_entry_) {
-      cluster_->GetFirst(block_entry_);
+    if (!(*inOutEntry)) {
+      (*inOutCluster)->GetFirst(*inOutEntry);
     } else {
-      cluster_->GetNext(block_entry_, block_entry_);
+      (*inOutCluster)->GetNext(*inOutEntry, *inOutEntry);
     }
 
-    // Move to next cluster if needed.
-    while (!block_entry_) {
-      cluster_ = segment_->GetNext(cluster_);
-      if (!cluster_) return false;
-      cluster_->GetFirst(block_entry_);
+    while (!(*inOutEntry)) {
+      *inOutCluster = segment_->GetNext(*inOutCluster);
+      if (!(*inOutCluster)) return false;
+      (*inOutCluster)->GetFirst(*inOutEntry);
     }
 
-    const Block* block = block_entry_->GetBlock();
-    if (!block) continue;
-
-    if (block->GetTrackNumber() != video_track_->GetNumber()) continue;
-
-    const int frame_count = block->GetFrameCount();
-    if (frame_count <= 0) continue;
-
-    // Most VP9-in-WebM is one frame per block. If laced, simplest is to skip
-    // (or we can concatenate; ask if you want that).
-    if (frame_count != 1) {
-      continue;
-    }
-
-    const Block::Frame& frame = block->GetFrame(0);
-    if (frame.len <= 0) continue;
-
+    const Block* b = (*inOutEntry)->GetBlock();
+    if (!b) continue;
+    if (b->GetTrackNumber() != track->GetNumber()) continue;
+    if (b->GetFrameCount() != 1) continue;  // keep it simple
+    *outBlock = b;
     return true;
   }
 }
 
-bool WebmDemuxer::readFrame(uint8_t** data, size_t* size) {
-  if (!data || !size) return false;
-  *data = nullptr;
-  *size = 0;
+bool WebmDemuxer::readBlockPayload(const Block* block, MkvReader* reader,
+                                  uint8_t** ioBuf, size_t* ioBufSize,
+                                  const uint8_t** outPtr, size_t* outSize) {
+  if (!block || !reader || !ioBuf || !ioBufSize || !outPtr || !outSize) return false;
+  *outPtr = nullptr;
+  *outSize = 0;
 
-  if (!segment_ || !cluster_ || !block_entry_ || !video_track_) return false;
-
-  const Block* block = block_entry_->GetBlock();
-  if (!block) return false;
-
-  // Ensure we’re on a valid VP9 block. If not, advance.
-  if (block->GetTrackNumber() != video_track_->GetNumber() ||
-      block->GetFrameCount() != 1) {
-    if (!advanceToNextVp9Block()) return false;
-    block = block_entry_->GetBlock();
-    if (!block) return false;
-  }
-
+  if (block->GetFrameCount() != 1) return false;
   const Block::Frame& frame = block->GetFrame(0);
+  if (frame.len <= 0) return false;
 
-  if (static_cast<size_t>(frame.len) > buffer_size_) {
-    uint8_t* new_buf = static_cast<uint8_t*>(std::realloc(buffer_, frame.len));
-    if (!new_buf) return false;
-    buffer_ = new_buf;
-    buffer_size_ = static_cast<size_t>(frame.len);
+  const size_t need = static_cast<size_t>(frame.len);
+  if (need > *ioBufSize) {
+    uint8_t* nb = static_cast<uint8_t*>(std::realloc(*ioBuf, need));
+    if (!nb) return false;
+    *ioBuf = nb;
+    *ioBufSize = need;
   }
 
-  // IMPORTANT: mkvparser::Block::Frame has no "data". Use Frame::Read().
-  const long read_status = frame.Read(reader_, buffer_);
-  if (read_status != 0) {
-    return false;
-  }
+  if (frame.Read(reader, *ioBuf) != 0) return false;
 
-  *data = buffer_;
-  *size = static_cast<size_t>(frame.len);
-
-  // Advance for next call.
-  if (!advanceToNextVp9Block()) {
-    // EOF is fine: caller will get false next time.
-  }
-
+  *outPtr = *ioBuf;
+  *outSize = need;
   return true;
 }
 
-bool WebmDemuxer::seekMs(int64_t timeMs) {
-  if (!segment_ || !video_track_) return false;
+bool WebmDemuxer::readPairedFrame(const uint8_t** colorData, size_t* colorSize,
+                                 const uint8_t** alphaData, size_t* alphaSize,
+                                 int64_t* timeNs) {
+  if (!colorData || !colorSize || !alphaData || !alphaSize) return false;
+  *colorData = nullptr; *colorSize = 0;
+  *alphaData = nullptr; *alphaSize = 0;
+  if (timeNs) *timeNs = -1;
 
-  const Cues* cues = segment_->GetCues();
-  if (!cues) return false;
+  if (!color_track_ || !alpha_track_) return false;
 
-  const long long timeNs = static_cast<long long>(timeMs) * 1000000LL;
+  const Block* cb = nullptr;
+  const Block* ab = nullptr;
 
-  const CuePoint* cue = nullptr;
-  const CuePoint::TrackPosition* track_pos = nullptr;
+  // Prime both.
+  if (!readNextBlockForTrack(color_track_, &color_entry_, &color_cluster_, &cb)) return false;
+  if (!readNextBlockForTrack(alpha_track_, &alpha_entry_, &alpha_cluster_, &ab)) return false;
 
-  if (!cues->Find(timeNs, video_track_, cue, track_pos)) {
-    return false;
-  }
-  if (!cue || !track_pos) return false;
+  // Align by timestamp (best-effort).
+  int64_t ct = blockTimeNs(cb, color_cluster_);
+  int64_t at = blockTimeNs(ab, alpha_cluster_);
 
-  // track_pos->m_pos is cluster position (relative to segment start)
-  const Cluster* c = segment_->FindOrPreloadCluster(track_pos->m_pos);
-  if (!c || c->EOS()) return false;
-
-  // Try to get the exact block from cue information.
-  const BlockEntry* be = c->GetEntry(*cue, *track_pos);
-  if (!be || be->EOS()) {
-    // Fallback: start from first block in cluster, then advance until we find VP9.
-    cluster_ = c;
-    block_entry_ = nullptr;
-    return advanceToNextVp9Block();
-  }
-
-  cluster_ = c;
-  block_entry_ = be;
-
-  // Ensure next readFrame() returns a VP9 block.
-  const Block* block = block_entry_->GetBlock();
-  if (!block || block->GetTrackNumber() != video_track_->GetNumber()) {
-    return advanceToNextVp9Block();
+  // Allow small drift due to encoder, but here we do strict alignment by advancing the earlier.
+  while (ct != at) {
+    if (ct < 0 || at < 0) break;
+    if (ct < at) {
+      // advance color
+      if (!readNextBlockForTrack(color_track_, &color_entry_, &color_cluster_, &cb)) return false;
+      ct = blockTimeNs(cb, color_cluster_);
+    } else {
+      // advance alpha
+      if (!readNextBlockForTrack(alpha_track_, &alpha_entry_, &alpha_cluster_, &ab)) return false;
+      at = blockTimeNs(ab, alpha_cluster_);
+    }
   }
 
+  if (!readBlockPayload(cb, reader_, &color_buf_, &color_buf_size_, colorData, colorSize)) return false;
+  if (!readBlockPayload(ab, reader_, &alpha_buf_, &alpha_buf_size_, alphaData, alphaSize)) return false;
+
+  if (timeNs) *timeNs = (ct >= 0) ? ct : at;
   return true;
+}
+
+bool WebmDemuxer::seekMs(int64_t /*timeMs*/) {
+  // TODO: implement paired seek using Cues for each track.
+  // For now, simplest: return false / not supported.
+  return false;
 }
 
 void WebmDemuxer::close() {
-  if (segment_) {
-    delete segment_;
-    segment_ = nullptr;
-  }
-  if (reader_) {
-    reader_->Close();
-    delete reader_;
-    reader_ = nullptr;
-  }
+  if (segment_) { delete segment_; segment_ = nullptr; }
+  if (reader_) { reader_->Close(); delete reader_; reader_ = nullptr; }
 
-  cluster_ = nullptr;
-  block_entry_ = nullptr;
-  video_track_ = nullptr;
+  color_track_ = nullptr;
+  alpha_track_ = nullptr;
+  color_cluster_ = nullptr;
+  alpha_cluster_ = nullptr;
+  color_entry_ = nullptr;
+  alpha_entry_ = nullptr;
 
-  if (buffer_) {
-    std::free(buffer_);
-    buffer_ = nullptr;
-    buffer_size_ = 0;
-  }
+  if (color_buf_) { std::free(color_buf_); color_buf_ = nullptr; color_buf_size_ = 0; }
+  if (alpha_buf_) { std::free(alpha_buf_); alpha_buf_ = nullptr; alpha_buf_size_ = 0; }
 }
